@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=yc-user
-WorkingDirectory=/home/yc-user/feed-me-chinese
-Environment="PATH=/home/yc-user/feed-me-chinese/venv/bin"
-ExecStart=/home/yc-user/feed-me-chinese/venv/bin/python vocab_based_chinese_bot.py
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/feed-me-chinese
+Environment="PATH=/home/YOUR_USERNAME/feed-me-chinese/venv/bin"
+ExecStart=/home/YOUR_USERNAME/feed-me-chinese/venv/bin/python vocab_based_chinese_bot.py
 Restart=always
 RestartSec=10
 
