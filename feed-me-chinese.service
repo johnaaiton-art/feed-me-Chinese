@@ -1,0 +1,15 @@
+[Unit]
+Description=Feed Me Chinese Vocabulary Bot
+After=network.target
+
+[Service]
+Type=simple
+User=yc-user
+WorkingDirectory=/home/yc-user/feed-me-chinese
+Environment="PATH=/home/yc-user/feed-me-chinese/venv/bin"
+ExecStart=/home/yc-user/feed-me-chinese/venv/bin/python vocab_based_chinese_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
