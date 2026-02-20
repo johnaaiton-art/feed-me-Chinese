@@ -1,554 +1,829 @@
-﻿import os
-import logging
-import random
+import os
 import json
-import io
-import tempfile
-from typing import List, Dict, Optional
+import hashlib
 import re
-from dotenv import load_dotenv
-load_dotenv()
-
-import telebot
-from telebot import types
+import zipfile
+import time
+from datetime import datetime
+from collections import defaultdict
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
 from google.cloud import texttospeech
 from google.oauth2 import service_account
-import langdetect
-
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+import asyncio
+from io import BytesIO
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Environment variables
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
-GOOGLE_CREDS_PATH = os.getenv('GOOGLE_CREDS_PATH', '/home/user/google-creds.json')
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
-# Initialize bot
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+# Load Google credentials from file if not in env
+if not GOOGLE_CREDENTIALS_JSON and os.path.exists("google-creds.json"):
+    with open("google-creds.json", "r") as f:
+        GOOGLE_CREDENTIALS_JSON = f.read()
 
-# Initialize DeepSeek client
+# Configuration
+class Config:
+    MAX_TOPIC_LENGTH = 200
+    TTS_TIMEOUT = 30
+    API_RETRY_ATTEMPTS = 3
+    RATE_LIMIT_REQUESTS = 5
+    RATE_LIMIT_WINDOW = 3600
+    MAX_FILE_SIZE = 50 * 1024 * 1024
+    
+    # Primary Chirp3 voices
+    CHIRP3_VOICES = [
+        "cmn-CN-Chirp3-HD-Aoede",
+        "cmn-CN-Chirp3-HD-Leda",
+        "cmn-CN-Chirp3-HD-Puck"
+    ]
+    
+    # Backup voices
+    CHIRP3_BACKUP_VOICES = [
+        "cmn-CN-Chirp3-HD-Leda",
+        "cmn-CN-Chirp3-HD-Aoede"
+    ]
+    
+    ANKI_VOICE = "cmn-CN-Chirp3-HD-Leda"
+    
+    # Fallback to Wavenet if Chirp3 fails
+    FALLBACK_VOICES = [
+        "cmn-CN-Wavenet-A",
+        "cmn-CN-Wavenet-B"
+    ]
+
+config = Config()
+
 deepseek_client = OpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com"
 )
 
-# Initialize Google TTS
-credentials = service_account.Credentials.from_service_account_file(GOOGLE_CREDS_PATH)
-tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
-
-# Voice configurations
-CHIRP_VOICES = {
-    'en': [
-        "en-US-Chirp3-HD-Achird",
-        "en-US-Chirp3-HD-Callirrhoe",
-        "en-US-Chirp3-HD-Achernar",
-        "en-US-Chirp3-HD-Algenib",
-        "en-US-Chirp3-HD-Erinome",
-        "en-US-Chirp3-HD-Schedar",
-        "en-US-Chirp3-HD-Kore"
-    ],
-    'es': [
-        "es-ES-Chirp-HD-F",
-        "es-ES-Chirp-HD-O",
-        "es-ES-Chirp3-HD-Gacrux",
-        "es-US-Chirp3-HD-Leda",
-        "es-ES-Chirp3-HD-Algenib",
-        "es-ES-Chirp3-HD-Charon",
-        "es-US-Chirp3-HD-Algieba"
-    ],
-    'zh': [
-        "cmn-CN-Chirp3-HD-Aoede",
-        "cmn-CN-Chirp3-HD-Leda",
-        "cmn-CN-Chirp3-HD-Puck"
-    ]
-}
-
-# Word count by level
-WORD_COUNTS = {
-    'C2': 500,
-    'C1': 400,
-    'B2': 300,
-    'B1': 250,
-    'A2': 150,
-    'A1': 50
-}
-
-# Audio speed by level
-AUDIO_SPEEDS = {
-    'C2': 1.0,   # 100%
-    'C1': 1.0,   # 100%
-    'B2': 0.90,  # 90%
-    'B1': 0.90,  # 90%
-    'A2': 0.70,  # 70%
-    'A1': 0.70   # 70%
-}
-
-# Store user sessions
+# User session storage
 user_sessions = {}
 
-# Common function words to filter out (basic list)
-FILTER_WORDS = {
-    'en': {'a', 'an', 'the', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from',
-           'have', 'has', 'had', 'be', 'is', 'are', 'was', 'were', 'been', 'being',
-           'do', 'does', 'did', 'will', 'would', 'should', 'could', 'can', 'may', 
-           'might', 'must', 'shall'},
-    'es': {'el', 'la', 'los', 'las', 'un', 'una', 'de', 'en', 'a', 'por', 'para',
-           'con', 'sin', 'ser', 'estar', 'haber', 'tener', 'hacer', 'poder', 'deber'},
-    'zh': {'的', '了', '在', '是', '我', '有', '和', '人', '这', '中', '大', '为', '上', '个', '国'}
-}
-
-
-class UserSession:
-    def __init__(self):
-        self.words: List[str] = []
-        self.language: Optional[str] = None
-        self.level: Optional[str] = None
-        self.topic: Optional[str] = None
-        self.raw_text: Optional[str] = None
-        self.awaiting_column: bool = False
-        self.awaiting_confirmation: bool = False
-
-
-def detect_language(words: List[str]) -> str:
-    """Detect language from word list"""
-    sample_text = ' '.join(words[:10])
-    try:
-        lang_code = langdetect.detect(sample_text)
-        if lang_code in ['en']:
-            return 'en'
-        elif lang_code in ['es']:
-            return 'es'
-        elif lang_code in ['zh-cn', 'zh-tw']:
-            return 'zh'
-        else:
-            return 'en'  # default
-    except:
-        return 'en'
-
-
-def filter_words(words: List[str], language: str) -> List[str]:
-    """Filter out common function words and short words"""
-    filter_set = FILTER_WORDS.get(language, set())
-    filtered = []
+class RateLimiter:
+    def __init__(self, max_requests=5, window=3600):
+        self.requests = defaultdict(list)
+        self.max_requests = max_requests
+        self.window = window
     
-    for word in words:
-        word_clean = word.strip().lower()
-        # Skip if empty, too short (unless Chinese), or in filter list
-        if not word_clean:
-            continue
-        if language != 'zh' and len(word_clean) <= 2:
-            continue
-        if word_clean in filter_set:
-            continue
-        filtered.append(word.strip())
+    def is_allowed(self, user_id):
+        now = time.time()
+        user_requests = self.requests[user_id]
+        user_requests[:] = [req_time for req_time in user_requests if now - req_time < self.window]
+        
+        if len(user_requests) >= self.max_requests:
+            return False
+        
+        user_requests.append(now)
+        return True
     
-    return filtered
+    def get_reset_time(self, user_id):
+        if not self.requests[user_id]:
+            return 0
+        oldest_request = min(self.requests[user_id])
+        reset_time = oldest_request + self.window - time.time()
+        return max(0, int(reset_time))
 
+rate_limiter = RateLimiter(
+    max_requests=config.RATE_LIMIT_REQUESTS,
+    window=config.RATE_LIMIT_WINDOW
+)
 
-def parse_anki_export(text: str) -> List[str]:
-    """Parse Anki export format and extract first column"""
-    lines = text.split('\n')
-    words = []
+def get_google_tts_client():
+    if GOOGLE_CREDENTIALS_JSON:
+        credentials_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        credentials = service_account.Credentials.from_service_account_info(
+            credentials_dict,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        return texttospeech.TextToSpeechClient(credentials=credentials)
+    else:
+        return texttospeech.TextToSpeechClient()
+
+def parse_vocabulary_list(text):
+    """Parse English-Russian vocabulary list, extract only English"""
+    lines = text.strip().split('\n')
+    vocab_items = []
     
     for line in lines:
         line = line.strip()
-        if not line or line.startswith('#') or 'Anki' in line or 'http' in line:
+        if not line:
             continue
         
-        parts = line.split('\t')
-        if parts:
-            words.append(parts[0].strip())
+        # Remove leading numbers (e.g., "1", "2.", etc.)
+        line = re.sub(r'^\d+\.?\s*', '', line)
+        
+        # Split by tab or multiple spaces
+        parts = re.split(r'\t+|\s{2,}', line)
+        
+        if len(parts) >= 2:
+            english = parts[0].strip()
+            # Ignore Russian (second part)
+            if english:
+                vocab_items.append(english)
     
-    return words
+    return vocab_items
 
+def validate_topic(topic):
+    topic = re.sub(r'\s+', ' ', topic.strip())
+    
+    if re.search(r'[<>"|&;`$()]', topic):
+        raise ValueError("Topic contains invalid characters")
+    
+    if len(topic) > config.MAX_TOPIC_LENGTH:
+        topic = topic[:config.MAX_TOPIC_LENGTH]
+    
+    if not topic:
+        raise ValueError("Topic cannot be empty")
+    
+    return topic
 
-def parse_column(text: str, column_num: int) -> List[str]:
-    """Parse specific column from AnkiDroid or tab-delimited text.
-    Handles BOM, #separator headers, tabs, and multi-space delimiters."""
-    # Remove BOM if present
-    text = text.lstrip('\ufeff')
-    lines = text.split('\n')
-    words = []
-
-    # Detect delimiter from Anki header if present
-    delimiter = '\t'  # default
-    for line in lines[:5]:
-        ls = line.strip()
-        if ls.startswith('#separator:'):
-            sep_value = ls.split(':', 1)[1].strip().lower()
-            if sep_value == 'tab':
-                delimiter = '\t'
-            elif sep_value == 'space':
-                delimiter = ' '
-            break
-
-    # Auto-detect if no header: check first real data line
-    else:
-        for line in lines:
-            ls = line.strip()
-            if not ls or ls.startswith('#'):
+def generate_tts_chirp3_sync(text, voice_name=None, speaking_rate=1.0):
+    """Generate TTS with fallback voices and return (audio, voice_used, success)"""
+    try:
+        client = get_google_tts_client()
+        voices_to_try = []
+        
+        if voice_name is None:
+            import random
+            primary_voice = random.choice(config.CHIRP3_VOICES)
+        else:
+            primary_voice = voice_name
+        
+        voices_to_try.append(primary_voice)
+        
+        for backup in config.CHIRP3_BACKUP_VOICES:
+            if backup != primary_voice and backup not in voices_to_try:
+                voices_to_try.append(backup)
+        
+        voices_to_try.extend(config.FALLBACK_VOICES)
+        
+        speaking_rate = max(0.25, min(2.0, speaking_rate))
+        
+        last_error = None
+        for current_voice in voices_to_try:
+            try:
+                print(f"[TTS] Trying voice: {current_voice} for '{text[:30]}...' @ {speaking_rate}x")
+                
+                synthesis_input = texttospeech.SynthesisInput(text=text)
+                voice = texttospeech.VoiceSelectionParams(
+                    language_code="cmn-CN",
+                    name=current_voice
+                )
+                audio_config = texttospeech.AudioConfig(
+                    audio_encoding=texttospeech.AudioEncoding.MP3,
+                    speaking_rate=speaking_rate
+                )
+                
+                response = client.synthesize_speech(
+                    input=synthesis_input,
+                    voice=voice,
+                    audio_config=audio_config,
+                    timeout=config.TTS_TIMEOUT
+                )
+                
+                if not response.audio_content:
+                    raise ValueError("Empty audio content")
+                
+                print(f"[TTS] ✅ SUCCESS: {current_voice} ({len(response.audio_content)} bytes)")
+                return response.audio_content, current_voice, True
+                
+            except Exception as e:
+                last_error = e
+                print(f"[TTS] ❌ FAILED: {current_voice} - {type(e).__name__}: {str(e)}")
                 continue
-            if '\t' in ls:
-                delimiter = '\t'
-            else:
-                delimiter = 'spaces'  # 2+ spaces fallback
-            break
-
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-
-        if delimiter == 'spaces':
-            parts = re.split(r'  +', line)
+        
+        print(f"[TTS ERROR] All voices failed for '{text[:50]}...'")
+        if last_error:
+            raise last_error
         else:
-            parts = line.split(delimiter)
+            raise Exception("All TTS voices failed")
+            
+    except Exception as e:
+        print(f"[TTS ERROR FINAL] '{text[:50]}...': {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None, None, False
 
-        parts = [p.strip() for p in parts]
+async def generate_tts_async(text, voice_name=None, speaking_rate=1.0):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, generate_tts_chirp3_sync, text, voice_name, speaking_rate)
 
-        if len(parts) >= column_num:
-            word = parts[column_num - 1].strip()
-            if word:
-                words.append(word)
-        else:
-            logger.debug(f"Line has {len(parts)} cols (need {column_num}): {line[:60]}")
+def safe_filename(filename):
+    filename = re.sub(r'[^\w\s.-]', '', filename)
+    filename = filename.replace('..', '').replace('/', '').replace('\\', '')
+    filename = os.path.basename(filename)
+    filename = filename[:100]
+    return filename.strip('_')
 
-    logger.info(f"parse_column: {len(words)} words from col {column_num}, delimiter={repr(delimiter)}")
-    return words
-
-
-def generate_text_with_vocab(words: List[str], topic: str, level: str, language: str) -> Dict:
-    """Generate text using DeepSeek with vocabulary words"""
-    word_count = WORD_COUNTS[level]
+@retry(
+    stop=stop_after_attempt(config.API_RETRY_ATTEMPTS),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((Exception,)),
+    before_sleep=lambda retry_state: print(f"Retry {retry_state.attempt_number}: {retry_state.outcome.exception()}")
+)
+def translate_vocabulary_to_chinese(english_phrases):
+    """Translate English phrases to Chinese with pinyin"""
+    print(f"[DeepSeek] Translating {len(english_phrases)} phrases to Chinese...")
     
-    # Create prompt based on level
-    if level == 'C2':
-        complexity_instruction = """Create a sophisticated, academically rigorous text that provides:
-- Critical analysis and nuanced arguments
-- Philosophical or theoretical depth
-- Multiple perspectives and counterarguments
-- Advanced insights beyond surface-level explanations
-This is NOT an introductory overview - assume the reader is already familiar with the topic."""
-    else:
-        complexity_instruction = f"Create an engaging text appropriate for CEFR {level} level."
+    phrases_list = "\n".join([f"{i+1}. {phrase}" for i, phrase in enumerate(english_phrases)])
     
-    # Language-specific instructions
-    lang_names = {'en': 'English', 'es': 'Spanish', 'zh': 'Chinese'}
-    
-    prompt = f"""Write a {word_count}-word text in {lang_names[language]} about: {topic}
+    prompt = f"""Translate these English phrases to Mandarin Chinese (Simplified).
+For each phrase, provide:
+- Chinese translation (natural, HSK5 level)
+- Pinyin with tone marks
 
-{complexity_instruction}
+English phrases:
+{phrases_list}
 
-Vocabulary words to incorporate naturally (use as many as flow naturally, prioritize natural writing):
-{', '.join(words[:30])}
-
-IMPORTANT INSTRUCTIONS:
-1. Write naturally and prioritize content quality over forcing vocabulary
-2. Use vocabulary words flexibly - adapt tense, form, or use related phrases
-3. For phrases like "get things on track", you can use variations like "got their life on track"
-4. Focus on the topic and ideas - don't sacrifice coherence to use more words
-5. Return your response as JSON with this exact structure:
+Return ONLY valid JSON in this exact format:
 {{
-    "text": "your full text here",
-    "words_used": ["word1", "word2", "word3"]
+  "vocabulary": [
+    {{"english": "phrase 1", "chinese": "中文翻译", "pinyin": "pīnyīn"}},
+    {{"english": "phrase 2", "chinese": "中文翻译", "pinyin": "pīnyīn"}}
+  ]
 }}
 
-Return ONLY valid JSON, no other text."""
+Requirements:
+1. Maintain phrase meaning precisely
+2. Use natural Chinese expressions
+3. HSK5 vocabulary level
+4. Accurate pinyin with tone marks
+5. ONLY valid JSON, no other text"""
 
     try:
         response = deepseek_client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": f"Expert {lang_names[language]} content creator. Return valid JSON only."},
+                {"role": "system", "content": "Expert Chinese translator. Return only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            timeout=45.0
+        )
+        
+        content_text = response.choices[0].message.content
+        
+        # Extract JSON
+        json_match = re.search(r'\{.*\}', content_text, re.DOTALL)
+        if json_match:
+            content_text = json_match.group()
+        
+        content = json.loads(content_text)
+        
+        if 'vocabulary' not in content or not isinstance(content['vocabulary'], list):
+            raise ValueError("Invalid response format")
+        
+        # Validate all items have required fields
+        for item in content['vocabulary']:
+            if not all(k in item for k in ['english', 'chinese', 'pinyin']):
+                raise ValueError("Missing required fields in vocabulary item")
+        
+        print(f"[DeepSeek] ✅ Translated {len(content['vocabulary'])} phrases")
+        return content['vocabulary']
+        
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] JSON parse: {str(e)}")
+        print(f"[ERROR] Raw: {content_text[:200]}...")
+        raise
+    except Exception as e:
+        print(f"[ERROR] DeepSeek: {type(e).__name__}: {str(e)}")
+        raise
+
+@retry(
+    stop=stop_after_attempt(config.API_RETRY_ATTEMPTS),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((Exception,)),
+    before_sleep=lambda retry_state: print(f"Retry {retry_state.attempt_number}: {retry_state.outcome.exception()}")
+)
+def generate_content_with_vocabulary(topic, vocabulary):
+    """Generate main text and opinions using provided vocabulary"""
+    print(f"[DeepSeek] Generating content for: {topic[:50]}...")
+    
+    vocab_list = "\n".join([f"- {item['chinese']} ({item['english']})" for item in vocabulary])
+    
+    prompt = f"""You are a world-class consultant writing in Mandarin Chinese.
+
+Topic: "{topic}"
+
+You MUST use ALL of these vocabulary items in your writing:
+{vocab_list}
+
+Create content in this JSON structure:
+{{
+  "main_text": "Main text in Simplified Chinese (300-400 characters) about the topic. MUST use ALL vocabulary items naturally.",
+  "opinion_texts": {{
+    "positive": "Positive perspective (150-200 chars) using 8-10 vocabulary items",
+    "negative": "Critical perspective (150-200 chars) using 8-10 vocabulary items", 
+    "balanced": "Balanced perspective (150-200 chars) using 8-10 vocabulary items"
+  }}
+}}
+
+Requirements:
+1. ALL vocabulary items MUST appear in main_text
+2. Each opinion text uses 8-10 vocabulary items naturally
+3. HSK5 level writing
+4. Natural, engaging prose
+5. ONLY valid JSON
+
+The vocabulary items should be woven naturally into the text, not forced."""
+
+    try:
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": "Expert Chinese writer. HSK5 level. Return only valid JSON."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7,
             timeout=60.0
         )
         
-        result_text = response.choices[0].message.content.strip()
+        content_text = response.choices[0].message.content
         
-        # Try to parse JSON
-        try:
-            result = json.loads(result_text)
-        except json.JSONDecodeError:
-            # Try to extract JSON if there's extra text
-            json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group())
-            else:
-                raise ValueError("Could not parse JSON from response")
+        # Extract JSON
+        json_match = re.search(r'\{.*\}', content_text, re.DOTALL)
+        if json_match:
+            content_text = json_match.group()
         
-        return result
+        content = json.loads(content_text)
         
+        # Validate structure
+        required_keys = ["main_text", "opinion_texts"]
+        if not all(k in content for k in required_keys):
+            raise ValueError(f"Missing required keys")
+        
+        if not all(k in content['opinion_texts'] for k in ['positive', 'negative', 'balanced']):
+            raise ValueError("opinion_texts needs 'positive', 'negative', 'balanced'")
+        
+        print(f"[DeepSeek] ✅ Content generated successfully")
+        return content
+        
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] JSON parse: {str(e)}")
+        print(f"[ERROR] Raw: {content_text[:200]}...")
+        raise
     except Exception as e:
-        logger.error(f"Error generating text: {e}")
+        print(f"[ERROR] DeepSeek: {type(e).__name__}: {str(e)}")
         raise
 
+async def create_vocabulary_file_with_tts(vocabulary, topic):
+    """Create vocab file with TTS for Anki"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    topic_truncated = topic[:50] if len(topic) > 50 else topic
+    safe_topic_name = safe_filename(topic_truncated)
+    filename = f"{safe_topic_name}_{timestamp}_vocabulary.txt"
+    
+    content = ""
+    audio_files = {}
+    voice_info = []
+    
+    total_items = len(vocabulary)
+    tts_tasks = []
+    
+    # Generate all TTS in parallel
+    for item in vocabulary:
+        tts_tasks.append(generate_tts_async(item['chinese'], voice_name=config.ANKI_VOICE, speaking_rate=0.8))
+    
+    audio_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
+    
+    for idx, (item, result) in enumerate(zip(vocabulary, audio_results)):
+        chinese_text = item['chinese']
+        
+        if isinstance(result, Exception):
+            print(f"TTS failed for '{chinese_text}': {result}")
+            voice_info.append(f"❌ {chinese_text}: FAILED - {str(result)[:50]}")
+            content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\n"
+        elif isinstance(result, tuple):
+            audio_data, voice_used, success = result
+            if success and audio_data:
+                hash_object = hashlib.md5(chinese_text.encode())
+                audio_filename = f"tts_{hash_object.hexdigest()}.mp3"
+                audio_filename = safe_filename(audio_filename)
+                audio_files[audio_filename] = audio_data
+                anki_tag = f"[sound:{audio_filename}]"
+                content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\t{anki_tag}\n"
+                voice_info.append(f"✅ {chinese_text}: {voice_used}")
+            else:
+                voice_info.append(f"❌ {chinese_text}: FAILED - no audio")
+                content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\n"
+        else:
+            voice_info.append(f"❌ {chinese_text}: FAILED - unexpected result")
+            content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\n"
+    
+    return filename, content, audio_files, voice_info
 
-def create_html_with_highlights(text: str, words_used: List[str]) -> str:
-    """Create HTML with highlighted vocabulary words"""
-    # Strip any markdown bold markers (**word**) before processing
-    html_text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+def create_html_document(topic, vocabulary, content, timestamp):
+    """Create HTML document"""
+    topic_truncated = topic[:50] if len(topic) > 50 else topic
+    safe_topic = safe_filename(topic_truncated)
+    html_filename = f"{safe_topic}_{timestamp}_materials.html"
     
-    # Sort words by length (longest first) to avoid partial matches
-    sorted_words = sorted(words_used, key=len, reverse=True)
+    # Vocabulary table
+    vocab_rows = ""
+    for i, item in enumerate(vocabulary, 1):
+        vocab_rows += f"<tr><td>{i}</td><td>{item['chinese']}</td><td>{item['pinyin']}</td><td>{item['english']}</td></tr>\n"
     
-    for word in sorted_words:
-        # Use word boundaries and case-insensitive matching
-        pattern = re.compile(r'\b' + re.escape(word) + r'\w*\b', re.IGNORECASE)
-        html_text = pattern.sub(lambda m: f'<span class="vocab">{m.group()}</span>', html_text)
-    
-    html_template = f"""<!DOCTYPE html>
-<html>
+    html_content = f"""<!DOCTYPE html>
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{topic}</title>
     <style>
         body {{
-            font-family: Georgia, serif;
-            line-height: 1.8;
-            max-width: 800px;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 900px;
             margin: 40px auto;
             padding: 20px;
-            background-color: #f5f5f5;
+            line-height: 1.8;
+            background: #f5f5f5;
         }}
-        .content {{
-            background-color: white;
-            padding: 40px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        .header {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            text-align: center;
         }}
-        .vocab {{
-            color: #2563eb;
+        .header h1 {{
+            margin: 0;
+            font-size: 2em;
         }}
-        p {{
-            margin-bottom: 1.5em;
+        .section {{
+            background: white;
+            padding: 30px;
+            margin-bottom: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }}
+        .section h2 {{
+            color: #667eea;
+            border-bottom: 3px solid #667eea;
+            padding-bottom: 10px;
+            margin-top: 0;
+        }}
+        .main-text {{
+            font-size: 1.3em;
+            line-height: 2;
+            color: #333;
+            text-align: justify;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }}
+        th {{
+            background: #667eea;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+        }}
+        td {{
+            padding: 12px;
+            border-bottom: 1px solid #e0e0e0;
+        }}
+        tr:hover {{
+            background: #f8f9ff;
+        }}
+        .opinion-box {{
+            border-left: 4px solid #667eea;
+            padding: 20px;
+            margin: 15px 0;
+            background: #f8f9ff;
+            border-radius: 5px;
+        }}
+        .opinion-box.positive {{
+            border-left-color: #4caf50;
+            background: #f1f8f4;
+        }}
+        .opinion-box.negative {{
+            border-left-color: #f44336;
+            background: #fff3f3;
+        }}
+        .opinion-box.balanced {{
+            border-left-color: #ff9800;
+            background: #fff8f0;
+        }}
+        .opinion-label {{
+            font-weight: bold;
+            margin-bottom: 10px;
+            font-size: 1.1em;
+        }}
+        .opinion-text {{
+            font-size: 1.2em;
+            line-height: 1.9;
+            color: #333;
         }}
     </style>
 </head>
 <body>
-    <div class="content">
-        {html_text.replace(chr(10), '</p><p>')}
+    <div class="header">
+        <h1>{topic}</h1>
+    </div>
+    
+    <div class="section">
+        <h2>📖 Main Text</h2>
+        <div class="main-text">{content['main_text']}</div>
+    </div>
+    
+    <div class="section">
+        <h2>📝 Vocabulary</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Chinese</th>
+                    <th>Pinyin</th>
+                    <th>English</th>
+                </tr>
+            </thead>
+            <tbody>
+                {vocab_rows}
+            </tbody>
+        </table>
+    </div>
+    
+    <div class="section">
+        <h2>💭 Perspectives</h2>
+        
+        <div class="opinion-box positive">
+            <div class="opinion-label">✅ Positive View</div>
+            <div class="opinion-text">{content['opinion_texts']['positive']}</div>
+        </div>
+        
+        <div class="opinion-box negative">
+            <div class="opinion-label">⚠️ Critical View</div>
+            <div class="opinion-text">{content['opinion_texts']['negative']}</div>
+        </div>
+        
+        <div class="opinion-box balanced">
+            <div class="opinion-label">⚖️ Balanced View</div>
+            <div class="opinion-text">{content['opinion_texts']['balanced']}</div>
+        </div>
     </div>
 </body>
 </html>"""
     
-    return html_template
+    return html_filename, html_content
 
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    welcome_msg = """👋 Welcome to Custom Vocabulary Chinese Learning Bot!
 
-def generate_audio(text: str, language: str, level: str) -> bytes:
-    """Generate audio using Google TTS with appropriate speed"""
-    # Remove HTML tags and markdown bold markers for audio
-    clean_text = re.sub('<[^<]+?>', '', text)
-    clean_text = re.sub(r'\*\*(.+?)\*\*', r'\1', clean_text)
+📋 **How to use:**
+1. Send me your vocabulary list (English-Russian format)
+2. I'll ask for your topic
+3. Send the topic
+4. I'll create materials using YOUR vocabulary!
+
+📦 **You'll receive:**
+• HTML document with vocab table
+• Main text using all your vocabulary
+• 3 perspective texts (positive/critical/balanced)
+• Audio files for listening practice
+• Anki-ready vocabulary file with audio
+• ZIP package with all audio files
+
+Just paste your vocabulary list to begin!"""
     
-    # Select random voice
-    voice_name = random.choice(CHIRP_VOICES[language])
-    
-    # Get speed for level
-    speed = AUDIO_SPEEDS.get(level, 1.0)
-    
-    # Map language codes
-    lang_codes = {'en': 'en-US', 'es': 'es-ES', 'zh': 'cmn-CN'}
-    
-    synthesis_input = texttospeech.SynthesisInput(text=clean_text)
-    voice = texttospeech.VoiceSelectionParams(
-        language_code=lang_codes[language],
-        name=voice_name
-    )
-    audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3,
-        speaking_rate=speed
-    )
-    
-    response = tts_client.synthesize_speech(
-        input=synthesis_input,
-        voice=voice,
-        audio_config=audio_config
-    )
-    
-    return response.audio_content
+    await update.message.reply_text(welcome_msg)
 
-
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    bot.reply_to(message, 
-        "Welcome! 📚\n\n"
-        "Send me:\n"
-        "1. A .txt file with Anki cards (tab-delimited)\n"
-        "2. Or just paste a column of vocabulary words\n\n"
-        "I'll create a custom text using your vocabulary!")
-
-
-@bot.message_handler(content_types=['document'])
-def handle_document(message):
-    try:
-        file_info = bot.get_file(message.document.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        
-        # Decode text
-        text = downloaded_file.decode('utf-8')
-        
-        # Initialize session
-        user_id = message.from_user.id
-        user_sessions[user_id] = UserSession()
-        user_sessions[user_id].raw_text = text
-        user_sessions[user_id].awaiting_column = True
-        
-        bot.reply_to(message, 
-            "Got your file! 📄\n\n"
-            "Which column number contains your target vocabulary words?\n"
-            "(Enter just the number, e.g., 1 for first column)")
-        
-    except Exception as e:
-        logger.error(f"Error handling document: {e}")
-        bot.reply_to(message, "Sorry, I couldn't read that file. Please make sure it's a text file.")
-
-
-@bot.message_handler(func=lambda message: True)
-def handle_message(message):
-    user_id = message.from_user.id
-    text = message.text.strip()
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle vocabulary list or topic"""
+    user_id = update.effective_user.id
     
-    # Check if user has active session
+    if not rate_limiter.is_allowed(user_id):
+        reset_time = rate_limiter.get_reset_time(user_id)
+        await update.message.reply_text(
+            f"⏱️ Rate limit reached. Try again in {reset_time // 60} minutes."
+        )
+        return
+    
+    # Check if user has a session
     if user_id not in user_sessions:
-        user_sessions[user_id] = UserSession()
-    
-    session = user_sessions[user_id]
-    
-    # Handle column number input
-    if session.awaiting_column:
+        # This is vocabulary list
         try:
-            column_num = int(text)
-            words = parse_column(session.raw_text, column_num)
+            vocab_list = parse_vocabulary_list(update.message.text)
             
-            if not words:
-                # Give user diagnostic info
-                lines = session.raw_text.lstrip('\ufeff').split('\n')
-                first_real = next((l for l in lines if l.strip() and not l.strip().startswith('#')), '')
-                tab_count = first_real.count('\t')
-                bot.reply_to(message, 
-                    f"No words found in column {column_num}.\n\n"
-                    f"First data line has {tab_count} tab(s):\n`{first_real[:100]}`\n\n"
-                    f"Try column 1, or check if your file uses tabs.",
-                    parse_mode="Markdown")
+            if not vocab_list:
+                await update.message.reply_text(
+                    "❌ No vocabulary found. Please send a list in format:\n"
+                    "take up activities начать заниматься\n"
+                    "figure out what drains выяснить что истощает\n"
+                    "..."
+                )
                 return
             
-            session.words = words
-            session.language = detect_language(words)
-            session.words = filter_words(words, session.language)
-            session.awaiting_column = False
-            session.awaiting_confirmation = True
+            if len(vocab_list) > 30:
+                await update.message.reply_text(
+                    f"⚠️ Too many items ({len(vocab_list)}). Maximum is 30. Please reduce your list."
+                )
+                return
             
-            bot.reply_to(message, 
-                f"Found {len(session.words)} vocabulary words.\n\n"
-                f"Preview: {', '.join(session.words[:10])}{'...' if len(session.words) > 10 else ''}\n\n"
-                "Is this correct? (yes/no)")
+            # Store vocabulary and wait for topic
+            user_sessions[user_id] = {
+                'vocabulary_english': vocab_list,
+                'waiting_for_topic': True
+            }
             
-        except ValueError:
-            bot.reply_to(message, "Please enter a valid column number (e.g., 1, 2, 3)")
-        return
-    
-    # Handle confirmation
-    if session.awaiting_confirmation:
-        if text.lower() in ['yes', 'y', 'да', 'sí']:
-            session.awaiting_confirmation = False
+            vocab_preview = "\n".join([f"• {v}" for v in vocab_list[:10]])
+            if len(vocab_list) > 10:
+                vocab_preview += f"\n... and {len(vocab_list) - 10} more"
             
-            # Ask for level
-            markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-            markup.row('C2', 'C1', 'B2')
-            markup.row('B1', 'A2', 'A1')
-            
-            bot.reply_to(message, "Great! Select your language level:", reply_markup=markup)
-        else:
-            user_sessions.pop(user_id, None)
-            bot.reply_to(message, "Okay, let's start over. Send me your vocabulary list.")
-        return
-    
-    # Handle level selection
-    if not session.level and text.upper() in WORD_COUNTS:
-        session.level = text.upper()
-        bot.reply_to(message, 
-            f"Perfect! Level {session.level} selected.\n\n"
-            "Now, what topic or question would you like the text about?",
-            reply_markup=types.ReplyKeyboardRemove())
-        return
-    
-    # Handle topic input
-    if session.level and not session.topic:
-        session.topic = text
-        
-        bot.reply_to(message, "Creating your text... ⏳\nThis may take a minute.")
-        
-        try:
-            # Generate text
-            result = generate_text_with_vocab(
-                session.words,
-                session.topic,
-                session.level,
-                session.language
+            await update.message.reply_text(
+                f"✅ Received {len(vocab_list)} vocabulary items:\n\n{vocab_preview}\n\n"
+                f"📝 Now send me your topic!"
             )
             
-            generated_text = result['text']
-            words_used = result['words_used']
+        except Exception as e:
+            print(f"[ERROR] Parsing vocab: {type(e).__name__}: {str(e)}")
+            await update.message.reply_text(
+                "❌ Error parsing vocabulary. Please check format and try again."
+            )
+    
+    else:
+        # This is the topic
+        session = user_sessions[user_id]
+        
+        if not session.get('waiting_for_topic'):
+            await update.message.reply_text(
+                "⚠️ Please start over with /start"
+            )
+            del user_sessions[user_id]
+            return
+        
+        try:
+            topic = validate_topic(update.message.text)
             
-            # Create HTML
-            html_content = create_html_with_highlights(generated_text, words_used)
+            status_msg = await update.message.reply_text(
+                "🔄 Processing your request...\n"
+                "📝 Translating vocabulary to Chinese..."
+            )
             
-            # Send HTML file
-            html_file = io.BytesIO(html_content.encode('utf-8'))
-            html_file.name = 'text.html'
-            bot.send_document(message.chat.id, html_file, 
-                caption=f"✅ Used {len(words_used)} vocabulary words:\n{', '.join(words_used)}")
+            # Step 1: Translate vocabulary
+            vocabulary = translate_vocabulary_to_chinese(session['vocabulary_english'])
             
-            # Generate and send audio (all levels including C2)
-            if session.level != 'NEVER':  # always generate audio
-                bot.send_message(message.chat.id, "Generating audio... 🔊")
-                audio_content = generate_audio(generated_text, session.language, session.level)
-                audio_file = io.BytesIO(audio_content)
-                audio_file.name = 'audio.mp3'
-                speed_percent = int(AUDIO_SPEEDS[session.level] * 100)
-                bot.send_audio(message.chat.id, audio_file, 
-                    caption=f"🎧 Audio at {speed_percent}% speed")
+            await status_msg.edit_text(
+                "✅ Vocabulary translated\n"
+                "🔄 Generating content using your vocabulary..."
+            )
+            
+            # Step 2: Generate content
+            content = generate_content_with_vocabulary(topic, vocabulary)
+            
+            await status_msg.edit_text(
+                "✅ Content generated\n"
+                "🎙️ Creating audio files..."
+            )
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_topic_name = safe_filename(topic[:50])
+            
+            # Step 3: Generate main text TTS
+            await status_msg.edit_text("🎙️ Creating main text audio...")
+            main_audio_data, main_voice_used, main_success = await generate_tts_async(
+                content['main_text'],
+                voice_name=None,  # Random Chirp3
+                speaking_rate=0.9
+            )
+            
+            # Step 4: Generate opinion TTS
+            await status_msg.edit_text("🎙️ Creating opinion audio files...")
+            opinion_audio_data = {}
+            opinion_voice_info = []
+            
+            for opinion_type in ['positive', 'negative', 'balanced']:
+                opinion_text = content['opinion_texts'][opinion_type]
+                audio_data, voice_used, success = await generate_tts_async(
+                    opinion_text,
+                    voice_name=None,  # Random Chirp3
+                    speaking_rate=0.9
+                )
+                if success and audio_data:
+                    opinion_audio_data[opinion_type] = audio_data
+                    opinion_voice_info.append(f"✅ {opinion_type}: {voice_used}")
+                else:
+                    opinion_voice_info.append(f"❌ {opinion_type}: FAILED")
+            
+            # Step 5: Create vocabulary with TTS
+            await status_msg.edit_text("🎙️ Creating vocabulary audio...")
+            vocab_filename, vocab_content, vocab_audio_files, vocab_voice_info = \
+                await create_vocabulary_file_with_tts(vocabulary, topic)
+            
+            # Step 6: Create HTML
+            await status_msg.edit_text("📝 Creating HTML document...")
+            html_filename, html_content = create_html_document(topic, vocabulary, content, timestamp)
+            
+            # Send voice report
+            voice_report = "🎙️ **TTS Voice Report**\n\n"
+            if main_success:
+                voice_report += f"**Main Text:** ✅ {main_voice_used}\n\n"
+            else:
+                voice_report += "**Main Text:** ❌ FAILED\n\n"
+            voice_report += "**Opinion Texts:**\n" + "\n".join(opinion_voice_info)
+            voice_report += f"\n\n**Vocabulary:** {len(vocab_audio_files)}/{len(vocabulary)} audio files created"
+            
+            await update.message.reply_text(voice_report)
+            
+            # Send files
+            await status_msg.edit_text("📤 Sending files...")
+            
+            # 1. HTML
+            html_buffer = BytesIO(html_content.encode('utf-8'))
+            html_buffer.seek(0)
+            await update.message.reply_document(
+                document=html_buffer,
+                filename=html_filename
+            )
+            
+            # 2. Main text audio
+            if main_success and main_audio_data:
+                main_audio_filename = f"{safe_topic_name}_{timestamp}_main.mp3"
+                main_audio_buffer = BytesIO(main_audio_data)
+                main_audio_buffer.seek(0)
+                await update.message.reply_audio(
+                    audio=main_audio_buffer,
+                    filename=main_audio_filename
+                )
+            
+            # 3. Opinion audio files
+            for opinion_type in ['positive', 'negative', 'balanced']:
+                if opinion_type in opinion_audio_data:
+                    audio_filename = f"{safe_topic_name}_{timestamp}_{opinion_type}.mp3"
+                    audio_buffer = BytesIO(opinion_audio_data[opinion_type])
+                    audio_buffer.seek(0)
+                    await update.message.reply_audio(
+                        audio=audio_buffer,
+                        filename=audio_filename
+                    )
+            
+            # 4. Anki vocabulary file
+            vocab_buffer = BytesIO(vocab_content.encode('utf-8'))
+            vocab_buffer.seek(0)
+            await update.message.reply_document(
+                document=vocab_buffer,
+                filename=vocab_filename
+            )
+            
+            # 5. ZIP with Anki audio
+            await status_msg.edit_text("📦 Creating Anki audio package...")
+            zip_buffer = BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                for filename, audio_data in vocab_audio_files.items():
+                    zip_file.writestr(filename, audio_data)
+            
+            zip_buffer.seek(0)
+            zip_filename = f"{safe_topic_name}_{timestamp}_anki_audio.zip"
+            await update.message.reply_document(
+                document=zip_buffer,
+                filename=zip_filename
+            )
+            
+            await status_msg.delete()
             
             # Clear session
-            user_sessions.pop(user_id, None)
-            bot.send_message(message.chat.id, 
-                "Done! 🎉\n\nSend me another vocabulary list when you're ready.")
+            del user_sessions[user_id]
             
+            await update.message.reply_text(
+                "✅ All done! Send new vocabulary list to create more materials."
+            )
+            
+        except ValueError as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+            if user_id in user_sessions:
+                del user_sessions[user_id]
         except Exception as e:
-            logger.error(f"Error in generation: {e}")
-            bot.reply_to(message, 
-                "Sorry, something went wrong. Please try again or contact support.")
-            user_sessions.pop(user_id, None)
-        
+            print(f"[ERROR] {type(e).__name__}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            await update.message.reply_text(
+                "❌ An error occurred. Please try again or contact support."
+            )
+            if user_id in user_sessions:
+                del user_sessions[user_id]
+
+def main():
+    """Start the bot"""
+    if not TELEGRAM_BOT_TOKEN:
+        print("ERROR: TELEGRAM_BOT_TOKEN not set")
         return
     
-    # Handle plain text paste (no file)
-    if not session.raw_text and '\n' in text:
-        words = [line.strip() for line in text.split('\n') if line.strip()]
-        session.words = words
-        session.language = detect_language(words)
-        session.words = filter_words(words, session.language)
-        session.awaiting_confirmation = True
-        
-        bot.reply_to(message, 
-            f"Found {len(session.words)} vocabulary words.\n\n"
-            f"Preview: {', '.join(session.words[:10])}{'...' if len(session.words) > 10 else ''}\n\n"
-            "Is this your vocabulary list? (yes/no)")
-        return
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # Default response
-    bot.reply_to(message, 
-        "Please send me a .txt file or paste your vocabulary words (one per line).")
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    print("🤖 Vocabulary-Based Chinese Bot starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
-if __name__ == '__main__':
-    logger.info("Bot starting...")
-    bot.infinity_polling()
+if __name__ == "__main__":
+    main()
