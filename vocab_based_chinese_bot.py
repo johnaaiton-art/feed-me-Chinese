@@ -789,12 +789,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             await status_msg.delete()
-            
+
+            # Save last session to disk so /speak works even after restart
+            save_last_session(user_id, {
+                'topic': topic,
+                'vocabulary': vocabulary,
+                'content': content
+            })
+
             # Clear session
             del user_sessions[user_id]
             
             await update.message.reply_text(
-                "✅ All done! Send new vocabulary list to create more materials."
+                "✅ All done! Send new vocabulary list to create more materials.\n\n"
+                "💬 When you've done your Anki cards and listened to the audio, "
+                "send /speak to practice speaking about this topic."
             )
             
         except ValueError as e:
@@ -811,6 +820,305 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user_id in user_sessions:
                 del user_sessions[user_id]
 
+# ─── SPEAKING MODE ────────────────────────────────────────────────────────────
+
+SESSIONS_DIR = "speaking_sessions"
+
+def save_last_session(user_id: int, data: dict):
+    """Save topic, vocab and content to disk for /speak to use later."""
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    path = os.path.join(SESSIONS_DIR, f"{user_id}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"[SPEAK] Saved session for user {user_id}")
+
+def load_last_session(user_id: int):
+    """Load last saved session for user, or None if not found."""
+    path = os.path.join(SESSIONS_DIR, f"{user_id}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def generate_speaking_questions(topic: str, vocabulary: list, content: dict) -> list:
+    """
+    Generate 5 speaking questions in Chinese using vocab items and ideas from the text.
+    Question types:
+      - "Do you agree that... [idea from text]?"
+      - "Is the idea that... also true in your country/experience?"
+      - "Do you know anybody who...?"
+    Each question uses 1-2 vocab items naturally.
+    Returns list of dicts: {question_zh, question_en, vocab_used}
+    """
+    vocab_list = "\n".join([
+        f"- {item['chinese']} ({item['pinyin']}) = {item['english']}"
+        for item in vocabulary
+    ])
+
+    prompt = f"""You are a Chinese speaking tutor creating conversation questions for an HSK5 student.
+
+Topic: {topic}
+
+Main text summary: {content['main_text'][:300]}
+
+Vocabulary available:
+{vocab_list}
+
+Create exactly 5 speaking questions in Chinese. Each question must:
+1. Use 1-2 vocabulary items from the list naturally
+2. Be based on an idea from the text
+3. Be short and clear (max 25 Chinese characters)
+4. Encourage a personal answer (not a yes/no dead end)
+5. Follow one of these patterns:
+   - 你同意...的观点吗？(Do you agree that...?)
+   - ...这个观点在你的国家/经历中也成立吗？(Is this idea true in your experience?)
+   - 你认识...的人吗？(Do you know anyone who...?)
+
+Do NOT make assumptions about the student's life.
+Vary the question types across the 5 questions.
+
+Return ONLY valid JSON:
+{{
+  "questions": [
+    {{
+      "question_zh": "Chinese question",
+      "question_en": "English translation",
+      "vocab_used": ["chinese vocab item 1", "chinese vocab item 2"]
+    }}
+  ]
+}}"""
+
+    try:
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": "Chinese speaking tutor. Return only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            timeout=45.0
+        )
+        content_text = response.choices[0].message.content
+        json_match = re.search(r'\{.*\}', content_text, re.DOTALL)
+        if json_match:
+            content_text = json_match.group()
+        data = json.loads(content_text)
+        questions = data.get("questions", [])
+        print(f"[SPEAK] Generated {len(questions)} questions")
+        return questions[:5]
+    except Exception as e:
+        print(f"[SPEAK ERROR] Question generation: {e}")
+        return []
+
+def generate_speaking_feedback(question_zh: str, question_en: str,
+                                vocab_used: list, user_text: str) -> str:
+    """Brief encouraging feedback on the student's spoken answer."""
+    prompt = f"""You are a brief, encouraging Chinese speaking tutor.
+
+Question asked (Chinese): {question_zh}
+Question (English): {question_en}
+Vocabulary the student should use: {', '.join(vocab_used)}
+Student said (transcribed): {user_text}
+
+Give brief feedback in English (max 3 sentences):
+1. One encouraging comment
+2. One specific correction or improvement if needed (grammar or vocab)
+3. If they didn't use the target vocabulary, suggest how they could have
+
+Be warm, concise, and specific. Do not repeat the full question."""
+
+    try:
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": "Brief, encouraging language tutor."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.6,
+            timeout=30.0
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[SPEAK ERROR] Feedback generation: {e}")
+        return "Good effort! Keep practising."
+
+def transcribe_voice_chinese(audio_path: str):
+    """Transcribe voice using Google STT for Mandarin Chinese."""
+    try:
+        from google.cloud import speech as google_speech
+        credentials_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        credentials = service_account.Credentials.from_service_account_info(
+            credentials_dict,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        client = google_speech.SpeechClient(credentials=credentials)
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
+        response = client.recognize(
+            config=google_speech.RecognitionConfig(
+                encoding=google_speech.RecognitionConfig.AudioEncoding.OGG_OPUS,
+                sample_rate_hertz=48000,
+                language_code="cmn-CN",
+                alternative_language_codes=["cmn-Hans-CN"]
+            ),
+            audio=google_speech.RecognitionAudio(content=audio_data)
+        )
+        if response.results:
+            return response.results[0].alternatives[0].transcript
+    except Exception as e:
+        print(f"[SPEAK STT ERROR] {e}")
+    return None
+
+async def speak_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/speak — start speaking practice on last generated topic."""
+    user_id = update.effective_user.id
+
+    session = load_last_session(user_id)
+    if not session:
+        await update.message.reply_text(
+            "No previous session found. Please send a vocabulary list and topic first "
+            "to generate materials, then use /speak."
+        )
+        return
+
+    topic    = session["topic"]
+    vocab    = session["vocabulary"]
+    content  = session["content"]
+
+    await update.message.reply_text(
+        f"💬 Speaking practice — topic: {topic}\n\n"
+        f"I'll ask you 5 questions in Chinese based on the text and vocabulary.\n"
+        f"Answer each one with a voice message. Ready? Here we go! 🎤"
+    )
+
+    # Generate questions
+    status = await update.message.reply_text("⏳ Generating questions...")
+    questions = generate_speaking_questions(topic, vocab, content)
+
+    if not questions:
+        await status.edit_text("❌ Could not generate questions. Please try again.")
+        return
+
+    await status.delete()
+
+    # Store speaking session in memory
+    user_sessions[user_id] = {
+        'mode': 'speaking',
+        'questions': questions,
+        'question_index': 0,
+        'topic': topic,
+        'vocab': vocab,
+    }
+
+    # Ask first question
+    await ask_speaking_question(update.effective_chat.id, context, user_id)
+
+async def ask_speaking_question(chat_id: int, context, user_id: int):
+    """Send the current speaking question with TTS."""
+    s         = user_sessions.get(user_id)
+    if not s:
+        return
+    idx       = s['question_index']
+    questions = s['questions']
+
+    if idx >= len(questions):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🎉 Speaking practice complete! Great work.\n\nSend a new vocab list any time to start again."
+        )
+        del user_sessions[user_id]
+        return
+
+    q = questions[idx]
+    question_zh = q['question_zh']
+    question_en = q['question_en']
+    vocab_used  = q.get('vocab_used', [])
+
+    # TTS for the question
+    audio_data, _, success = await generate_tts_async(question_zh, speaking_rate=0.85)
+
+    caption = (
+        f"Question {idx + 1}/5\n\n"
+        f"🇨🇳 {question_zh}\n"
+        f"🇬🇧 {question_en}\n\n"
+        f"Vocab to use: {', '.join(vocab_used)}\n\n"
+        f"Reply with a voice message 🎤"
+    )
+
+    if success and audio_data:
+        audio_buffer = BytesIO(audio_data)
+        audio_buffer.seek(0)
+        await context.bot.send_audio(
+            chat_id=chat_id,
+            audio=audio_buffer,
+            filename=f"question_{idx+1}.mp3",
+            caption=caption
+        )
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=caption)
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle voice messages during speaking practice."""
+    user_id = update.effective_user.id
+    s       = user_sessions.get(user_id)
+
+    if not s or s.get('mode') != 'speaking':
+        await update.message.reply_text(
+            "Use /speak to start speaking practice first."
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    # Download voice
+    voice_file = await update.effective_message.voice.get_file()
+    voice_path = f"/tmp/voice_{user_id}_{int(time.time())}.ogg"
+    await voice_file.download_to_drive(voice_path)
+
+    # Transcribe
+    user_text = transcribe_voice_chinese(voice_path)
+    os.remove(voice_path)
+
+    if not user_text:
+        await update.message.reply_text(
+            "Could not understand the audio. Please try again 🎤\n"
+            "(Make sure you're speaking clearly in Mandarin Chinese)"
+        )
+        return
+
+    # Get current question
+    idx = s['question_index']
+    q   = s['questions'][idx]
+
+    # Feedback
+    feedback = generate_speaking_feedback(
+        question_zh=q['question_zh'],
+        question_en=q['question_en'],
+        vocab_used=q.get('vocab_used', []),
+        user_text=user_text
+    )
+
+    await update.message.reply_text(
+        f"You said: {user_text}\n\n"
+        f"💬 {feedback}"
+    )
+
+    # Advance to next question
+    s['question_index'] += 1
+    if s['question_index'] < len(s['questions']):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Next question coming up..."
+        )
+        await ask_speaking_question(update.effective_chat.id, context, user_id)
+    else:
+        await update.message.reply_text(
+            "🎉 Speaking practice complete! Great work.\n\n"
+            "Send a new vocab list any time to create more materials."
+        )
+        del user_sessions[user_id]
+
+
 def main():
     """Start the bot"""
     if not TELEGRAM_BOT_TOKEN:
@@ -820,6 +1128,8 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("speak", speak_command))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     print("🤖 Vocabulary-Based Chinese Bot starting...")
