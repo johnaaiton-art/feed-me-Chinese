@@ -33,24 +33,23 @@ class Config:
     RATE_LIMIT_REQUESTS = 5
     RATE_LIMIT_WINDOW = 3600
     MAX_FILE_SIZE = 50 * 1024 * 1024
-    
-    # Primary Chirp3 voices
-    CHIRP3_VOICES = [
+
+    # Gemini 2.5 Pro TTS voices (via Vertex AI)
+    GEMINI_TTS_VOICES = ["Aoede", "Leda", "Puck", "Kore", "Charon"]
+    ANKI_VOICE = "Kore"
+
+    # Google Cloud project for Vertex AI
+    GOOGLE_PROJECT = "anki-332914"
+    VERTEX_LOCATION = "us-central1"
+    GEMINI_TTS_MODEL = "gemini-2.5-pro-preview-tts"
+
+    # Chirp3 fallback voices (used if Gemini fails)
+    CHIRP3_FALLBACK_VOICES = [
         "cmn-CN-Chirp3-HD-Aoede",
         "cmn-CN-Chirp3-HD-Leda",
         "cmn-CN-Chirp3-HD-Puck"
     ]
-    
-    # Backup voices
-    CHIRP3_BACKUP_VOICES = [
-        "cmn-CN-Chirp3-HD-Leda",
-        "cmn-CN-Chirp3-HD-Aoede"
-    ]
-    
-    ANKI_VOICE = "cmn-CN-Chirp3-HD-Leda"
-    
-    # Fallback to Wavenet if Chirp3 fails
-    FALLBACK_VOICES = [
+    WAVENET_FALLBACK_VOICES = [
         "cmn-CN-Wavenet-A",
         "cmn-CN-Wavenet-B"
     ]
@@ -143,72 +142,152 @@ def validate_topic(topic):
     
     return topic
 
-def generate_tts_chirp3_sync(text, voice_name=None, speaking_rate=1.0):
-    """Generate TTS with fallback voices and return (audio, voice_used, success)"""
+def _get_vertex_token():
+    """Get a fresh OAuth2 access token from the service account credentials."""
+    import google.auth.transport.requests
+    credentials_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+    credentials = service_account.Credentials.from_service_account_info(
+        credentials_dict,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+    credentials.refresh(google.auth.transport.requests.Request())
+    return credentials.token
+
+def _chirp3_fallback(text, speaking_rate=1.0):
+    """Chirp3 HD via Cloud TTS — used when Gemini TTS fails."""
     try:
         client = get_google_tts_client()
-        voices_to_try = []
-        
-        if voice_name is None:
-            import random
-            primary_voice = random.choice(config.CHIRP3_VOICES)
-        else:
-            primary_voice = voice_name
-        
-        voices_to_try.append(primary_voice)
-        
-        for backup in config.CHIRP3_BACKUP_VOICES:
-            if backup != primary_voice and backup not in voices_to_try:
-                voices_to_try.append(backup)
-        
-        voices_to_try.extend(config.FALLBACK_VOICES)
-        
-        speaking_rate = max(0.25, min(2.0, speaking_rate))
-        
-        last_error = None
-        for current_voice in voices_to_try:
-            try:
-                print(f"[TTS] Trying voice: {current_voice} for '{text[:30]}...' @ {speaking_rate}x")
-                
-                synthesis_input = texttospeech.SynthesisInput(text=text)
-                voice = texttospeech.VoiceSelectionParams(
-                    language_code="cmn-CN",
-                    name=current_voice
-                )
-                audio_config = texttospeech.AudioConfig(
-                    audio_encoding=texttospeech.AudioEncoding.MP3,
-                    speaking_rate=speaking_rate
-                )
-                
-                response = client.synthesize_speech(
-                    input=synthesis_input,
-                    voice=voice,
-                    audio_config=audio_config,
-                    timeout=config.TTS_TIMEOUT
-                )
-                
-                if not response.audio_content:
-                    raise ValueError("Empty audio content")
-                
-                print(f"[TTS] ✅ SUCCESS: {current_voice} ({len(response.audio_content)} bytes)")
-                return response.audio_content, current_voice, True
-                
-            except Exception as e:
-                last_error = e
-                print(f"[TTS] ❌ FAILED: {current_voice} - {type(e).__name__}: {str(e)}")
-                continue
-        
-        print(f"[TTS ERROR] All voices failed for '{text[:50]}...'")
-        if last_error:
-            raise last_error
-        else:
-            raise Exception("All TTS voices failed")
-            
-    except Exception as e:
-        print(f"[TTS ERROR FINAL] '{text[:50]}...': {type(e).__name__}: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        import random
+        voice_name = random.choice(config.CHIRP3_FALLBACK_VOICES)
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="cmn-CN",
+            name=voice_name
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=max(0.25, min(2.0, speaking_rate))
+        )
+        response = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config,
+            timeout=config.TTS_TIMEOUT
+        )
+        if response.audio_content:
+            print(f"[TTS Chirp3 fallback] ✅ {voice_name}")
+            return response.audio_content, voice_name, True
         return None, None, False
+    except Exception as e:
+        print(f"[TTS Chirp3 fallback] ❌ {e}")
+        # Last resort: Wavenet
+        try:
+            client = get_google_tts_client()
+            voice_name = config.WAVENET_FALLBACK_VOICES[0]
+            synthesis_input = texttospeech.SynthesisInput(text=text)
+            voice = texttospeech.VoiceSelectionParams(
+                language_code="cmn-CN",
+                name=voice_name
+            )
+            audio_config = texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.MP3,
+                speaking_rate=max(0.25, min(2.0, speaking_rate))
+            )
+            response = client.synthesize_speech(
+                input=synthesis_input,
+                voice=voice,
+                audio_config=audio_config,
+                timeout=config.TTS_TIMEOUT
+            )
+            return response.audio_content, voice_name, bool(response.audio_content)
+        except Exception as e2:
+            print(f"[TTS Wavenet fallback] ❌ {e2}")
+            return None, None, False
+
+def generate_tts_chirp3_sync(text, voice_name=None, speaking_rate=1.0):
+    """
+    Generate TTS using Gemini 2.5 Pro TTS via Vertex AI REST API.
+    Falls back to Chirp3 HD automatically if Gemini fails.
+    Returns (audio_bytes_mp3, voice_used, success).
+    """
+    import random
+    import base64
+    import urllib.request
+    import subprocess
+    import tempfile
+
+    voice = voice_name if voice_name and voice_name in config.GEMINI_TTS_VOICES \
+        else random.choice(config.GEMINI_TTS_VOICES)
+
+    pace = "a slower" if speaking_rate < 1.0 else "a normal"
+    style_prompt = f"Read aloud naturally in Mandarin Chinese at {pace} pace.\n\n{text}"
+
+    payload = json.dumps({
+        "contents": [{"role": "user", "parts": [{"text": style_prompt}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": voice}
+                }
+            }
+        }
+    }).encode("utf-8")
+
+    url = (
+        f"https://{config.VERTEX_LOCATION}-aiplatform.googleapis.com/v1/projects/"
+        f"{config.GOOGLE_PROJECT}/locations/{config.VERTEX_LOCATION}/"
+        f"publishers/google/models/{config.GEMINI_TTS_MODEL}:generateContent"
+    )
+
+    try:
+        token = _get_vertex_token()
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+        )
+        print(f"[TTS Gemini] Trying voice: {voice} for '{text[:30]}...' @ {speaking_rate}x")
+        with urllib.request.urlopen(req, timeout=config.TTS_TIMEOUT) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+
+        # Extract base64-encoded PCM audio
+        audio_b64 = (
+            result["candidates"][0]["content"]["parts"][0]
+            ["inlineData"]["data"]
+        )
+        pcm_bytes = base64.b64decode(audio_b64)
+
+        # Convert raw PCM (s16le, 24kHz, mono) to MP3 via ffmpeg
+        with tempfile.NamedTemporaryFile(suffix=".pcm", delete=False) as pcm_file:
+            pcm_file.write(pcm_bytes)
+            pcm_path = pcm_file.name
+        mp3_path = pcm_path.replace(".pcm", ".mp3")
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-f", "s16le", "-ar", "24000", "-ac", "1",
+                "-i", pcm_path,
+                mp3_path
+            ],
+            check=True,
+            capture_output=True
+        )
+        with open(mp3_path, "rb") as f:
+            mp3_bytes = f.read()
+        os.remove(pcm_path)
+        os.remove(mp3_path)
+
+        print(f"[TTS Gemini] ✅ {voice} ({len(mp3_bytes)} bytes)")
+        return mp3_bytes, voice, True
+
+    except Exception as e:
+        print(f"[TTS Gemini] ❌ {voice} failed: {type(e).__name__}: {e}")
+        print("[TTS Gemini] Falling back to Chirp3...")
+        return _chirp3_fallback(text, speaking_rate)
 
 async def generate_tts_async(text, voice_name=None, speaking_rate=1.0):
     loop = asyncio.get_event_loop()
@@ -692,7 +771,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text("🎙️ Creating main text audio...")
             main_audio_data, main_voice_used, main_success = await generate_tts_async(
                 content['main_text'],
-                voice_name=None,  # Random Chirp3
+                voice_name=None,
                 speaking_rate=0.9
             )
             
@@ -705,7 +784,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 opinion_text = content['opinion_texts'][opinion_type]
                 audio_data, voice_used, success = await generate_tts_async(
                     opinion_text,
-                    voice_name=None,  # Random Chirp3
+                    voice_name=None,
                     speaking_rate=0.9
                 )
                 if success and audio_data:
@@ -843,12 +922,6 @@ def load_last_session(user_id: int):
 def generate_speaking_questions(topic: str, vocabulary: list, content: dict) -> list:
     """
     Generate 5 speaking questions in Chinese using vocab items and ideas from the text.
-    Question types:
-      - "Do you agree that... [idea from text]?"
-      - "Is the idea that... also true in your country/experience?"
-      - "Do you know anybody who...?"
-    Each question uses 1-2 vocab items naturally.
-    Returns list of dicts: {question_zh, question_en, vocab_used}
     """
     vocab_list = "\n".join([
         f"- {item['chinese']} ({item['pinyin']}) = {item['english']}"
