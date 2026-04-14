@@ -236,6 +236,10 @@ Format:
 def _chirp3_tts(text: str, voice_name: str = "cmn-CN-Chirp3-HD-Aoede", speaking_rate: float = 0.85):
     """Generate Chirp3 HD TTS."""
     try:
+        if not text or len(text.strip()) == 0:
+            print(f"[Chirp3 TTS] Empty text provided")
+            return None, False
+            
         client = get_google_tts_client()
         synthesis_input = texttospeech.SynthesisInput(text=text)
         voice = texttospeech.VoiceSelectionParams(
@@ -253,10 +257,12 @@ def _chirp3_tts(text: str, voice_name: str = "cmn-CN-Chirp3-HD-Aoede", speaking_
             timeout=config.TTS_TIMEOUT
         )
         if response.audio_content:
+            print(f"[Chirp3 TTS ✓] {voice_name}: {len(response.audio_content)} bytes")
             return response.audio_content, True
+        print(f"[Chirp3 TTS ✗] No audio content returned for: {text[:30]}")
         return None, False
     except Exception as e:
-        print(f"[Chirp3 TTS error] {e}")
+        print(f"[Chirp3 TTS error] {voice_name}: {str(e)[:100]}")
         return None, False
 
 
@@ -435,22 +441,35 @@ async def handle_podcast_notes(update: Update, context: ContextTypes.DEFAULT_TYP
         
         # Generate audio and create ZIP
         audio_zip_data = BytesIO()
+        audio_count = 0
         with zipfile.ZipFile(audio_zip_data, 'w', zipfile.ZIP_DEFLATED) as zf:
             for i, line in enumerate(dialogue, 1):
                 speaker = line.get("speaker", "?")
                 text_zh = line.get("text_zh", "")
                 
+                if not text_zh:
+                    print(f"[ZIP] Line {i}: Empty text, skipping")
+                    continue
+                
                 # Determine gender
                 gender = "male" if "张" in speaker or "老师" in speaker else "female"
                 voice = "cmn-CN-Chirp3-HD-A" if gender == "male" else "cmn-CN-Chirp3-HD-B"
                 
+                print(f"[ZIP] Line {i}: {speaker} ({gender}): {text_zh[:30]}...")
+                
                 # Generate TTS
                 audio_data, success = _chirp3_tts(text_zh, voice, 0.85)
                 
-                if audio_data:
+                if audio_data and success:
                     safe_speaker = re.sub(r'[^\w]', '_', speaker)
                     filename = f"{i:02d}_{safe_speaker}.mp3"
                     zf.writestr(filename, audio_data)
+                    audio_count += 1
+                    print(f"[ZIP] ✓ Added {filename} ({len(audio_data)} bytes)")
+                else:
+                    print(f"[ZIP] ✗ TTS failed for line {i}")
+        
+        print(f"[ZIP] Complete: {audio_count}/{len(dialogue)} files added")
         
         audio_zip_data.seek(0)
         
