@@ -133,16 +133,24 @@ def parse_vocabulary_list(text):
     return vocab_items
 
 # ============================================================================
-# MODE 2: PODCAST DIALOGUE (NEW)
+# MODE 2: PODCAST DIALOGUE FROM NOTES (NEW)
 # ============================================================================
 
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=5))
-def generate_podcast_dialogue(topic: str, num_exchanges: int = 6):
-    """Generate HSK 4 level dialogue using DeepSeek."""
+def generate_podcast_dialogue(topic: str, notes: str, num_exchanges: int = 6):
+    """Generate HSK 4 level dialogue based on notes using DeepSeek."""
+    
+    # Truncate notes if too long
+    notes_truncated = notes[:1500] if len(notes) > 1500 else notes
     
     prompt = f"""You are a Mandarin Chinese dialogue writer for HSK 4 learners.
 
-Create a conversation about: "{topic}"
+Topic: "{topic}"
+
+Source material (notes/article):
+{notes_truncated}
+
+Create a conversation about this topic based on the notes provided.
 
 Rules:
 1. Two speakers: 张老师 (Teacher Zhang) and 小王 (Xiao Wang)
@@ -150,6 +158,8 @@ Rules:
 3. Each line: 15-35 characters max
 4. HSK 4 level (simple vocabulary)
 5. Natural, conversational tone
+6. Content should be based on the provided notes/article
+7. Include key facts and vocabulary from the notes
 
 Format as JSON (ONLY JSON, no markdown):
 [
@@ -260,13 +270,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Welcome to Feed Me Chinese!\n\n"
         "Choose a mode:\n\n"
         "📚 /vocab — Paste words → generates HSK 4 text\n"
-        "🎙️ /podcast — Enter topic → generates HSK 4 dialogue + audio\n"
+        "🎙️ /podcast — Enter topic + notes → generates HSK 4 dialogue + audio\n"
     )
 
 
 async def vocab_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start vocabulary mode."""
-    msg = await update.message.reply_text(
+    await update.message.reply_text(
         "📚 **Vocabulary Mode**\n\n"
         "Paste a list of Chinese words (one per line or tab-separated).\n\n"
         "Example:\n"
@@ -280,34 +290,32 @@ async def vocab_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def podcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start podcast mode."""
-    msg = await update.message.reply_text(
+    """Start podcast mode - step 1: get topic."""
+    await update.message.reply_text(
         "🎙️ **Podcast Mode**\n\n"
-        "Enter a topic for HSK 4 podcast dialogue.\n\n"
+        "Step 1: Enter a topic for your podcast.\n\n"
         "Examples:\n"
         "• Iran war and global economy\n"
         "• Climate change\n"
         "• Technology and AI\n\n"
-        "I'll generate:\n"
-        "✓ HSK 4 dialogue (6 exchanges)\n"
-        "✓ 10 useful phrases for Anki\n"
-        "✓ Audio files (Chirp3 at 85% speed)",
+        "(Then you'll paste your notes/article)",
         parse_mode="Markdown"
     )
-    context.user_data['mode'] = 'podcast_input'
+    context.user_data['mode'] = 'podcast_topic'
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages based on mode."""
-    user_id = update.effective_user.id
     mode = context.user_data.get('mode', None)
     
     if mode == 'vocab_input':
         await handle_vocab_input(update, context)
     elif mode == 'vocab_topic':
         await handle_vocab_topic(update, context)
-    elif mode == 'podcast_input':
-        await handle_podcast_input(update, context)
+    elif mode == 'podcast_topic':
+        await handle_podcast_topic(update, context)
+    elif mode == 'podcast_notes':
+        await handle_podcast_notes(update, context)
     else:
         await update.message.reply_text("Use /vocab or /podcast to start")
 
@@ -347,7 +355,7 @@ async def handle_vocab_topic(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         # Original vocab text generation (from your old bot)
         # This would go here - for now, just send placeholder
-        text_zh = f"关于{topic}的文本。" # Placeholder
+        text_zh = f"关于{topic}的文本。"
         text_en = f"Text about {topic}."
         
         # Generate audio
@@ -367,22 +375,43 @@ async def handle_vocab_topic(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.edit_message_text(f"❌ Error: {str(e)[:100]}", update.effective_chat.id, status.message_id)
 
 
-async def handle_podcast_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle podcast topic input."""
+async def handle_podcast_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle topic input for podcast - step 1."""
     topic = update.message.text.strip()
     
     if not topic or len(topic) < 3:
         await update.message.reply_text("❌ Topic must be at least 3 characters.")
         return
     
+    # Store topic and ask for notes
+    context.user_data['podcast_topic'] = topic
+    context.user_data['mode'] = 'podcast_notes'
+    
+    await update.message.reply_text(
+        f"✓ Topic: **{topic}**\n\n"
+        f"Step 2: Paste your notes/article about this topic.\n\n"
+        f"(The longer and more detailed, the better the dialogue!)",
+        parse_mode="Markdown"
+    )
+
+
+async def handle_podcast_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle notes input for podcast - step 2."""
+    notes = update.message.text.strip()
+    topic = context.user_data.get('podcast_topic', 'Unknown')
+    
+    if not notes or len(notes) < 10:
+        await update.message.reply_text("❌ Notes must be at least 10 characters. Please provide more detail.")
+        return
+    
     status = await update.message.reply_text(
-        f"🎙️ Creating podcast: **{topic}**\n⏳ Generating dialogue...",
+        f"🎙️ Creating podcast: **{topic}**\n⏳ Generating dialogue from notes...",
         parse_mode="Markdown"
     )
     
     try:
-        # Generate dialogue
-        dialogue = generate_podcast_dialogue(topic, num_exchanges=6)
+        # Generate dialogue based on notes
+        dialogue = generate_podcast_dialogue(topic, notes, num_exchanges=6)
         
         if not dialogue:
             raise Exception("Failed to generate dialogue")
